@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"path"
 	"strings"
 	"time"
@@ -13,66 +14,107 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	ecsTypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
+	"github.com/defang-io/defang/src/pkg"
 	"github.com/defang-io/defang/src/pkg/aws/region"
 )
 
 const spinner = `-\|/`
 
+const AwsLogsStreamPrefix = ProjectName
+
+func getLogStreamForTask(taskArn TaskArn) string {
+	return path.Join(AwsLogsStreamPrefix, ContainerName, taskID(taskArn)) // per "awslogs" driver
+}
+
+func taskID(taskArn TaskArn) string {
+	return path.Base(*taskArn)
+}
+
+func (a *AwsEcs) TailTask(ctx context.Context, taskArn TaskArn) (*LogStreamer, error) {
+	logStreamName := getLogStreamForTask(taskArn)
+	return a.TailLogStream(ctx, logStreamName) // TODO: io.EOF on task stop
+}
+
 func (a *AwsEcs) Tail(ctx context.Context, taskArn TaskArn) error {
-	// a.Refresh(ctx)
-
-	parts := strings.Split(*taskArn, ":")
-	if len(parts) == 6 {
-		a.Region = region.Region(parts[3])
-	}
-
-	taskId := path.Base(*taskArn)
-	logStreamName := path.Join(ProjectName, ContainerName, taskId)
-
-	cfg, err := a.LoadConfig(ctx)
+	a.Region = region.FromArn(string(*taskArn))
+	s, err := a.TailTask(ctx, taskArn)
 	if err != nil {
 		return err
 	}
 
-	// Use CloudWatch API to tail the logs
-	cw := cloudwatchlogs.NewFromConfig(cfg)
-
+	taskId := taskID(taskArn)
 	spinMe := 0
-	var nextToken *string
 	for {
-		nextToken, err = a.printLogEvents(ctx, cw, logStreamName, nextToken)
+		err = s.printLogEvents(ctx)
 		if err != nil {
-			return err
+			var resourceNotFound *types.ResourceNotFoundException
+			if !errors.As(err, &resourceNotFound) && err != io.EOF {
+				return err
+			}
+			// continue loop, waiting for the log stream to be created
 		}
 
-		// Use DescribeTasks API to check if the task is still running
-		ti, _ := ecs.NewFromConfig(cfg).DescribeTasks(ctx, &ecs.DescribeTasksInput{
-			Cluster: aws.String(a.ClusterARN), // arn:aws:ecs:us-west-2:532501343364:cluster/ecs-dev-cluster
-			Tasks:   []string{taskId},
-		})
-		if ti != nil && len(ti.Tasks) > 0 {
-			task := ti.Tasks[0]
-			switch task.StopCode {
-			default:
-				// Before we exit, grab any remaining logs
-				a.printLogEvents(ctx, cw, logStreamName, nextToken)
-				return taskFailure{string(task.StopCode), *task.StoppedReason}
-			case ecsTypes.TaskStopCodeEssentialContainerExited:
-				// Before we exit, grab any remaining logs
-				a.printLogEvents(ctx, cw, logStreamName, nextToken)
-				if *task.Containers[0].ExitCode == 0 {
-					return nil // Success
-				}
-				reason := fmt.Sprintf("%s with code %d", *task.StoppedReason, *task.Containers[0].ExitCode)
-				return taskFailure{string(task.StopCode), reason}
-			case "": // Task is still running
-			}
+		err := a.taskStatus(ctx, taskId)
+		if err != nil {
+			// Before we exit, print any remaining logs
+			s.printLogEvents(ctx)
+			return err
 		}
 
 		fmt.Printf("%c\r", spinner[spinMe%len(spinner)])
 		spinMe++
-		time.Sleep(1 * time.Second)
+		pkg.SleepWithContext(ctx, time.Second)
 	}
+}
+
+func (a *AwsEcs) TailLogStream(ctx context.Context, logStreamNamePrefixes ...string) (*LogStreamer, error) {
+	cfg, err := a.LoadConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	cw := cloudwatchlogs.NewFromConfig(cfg)
+	s, err := cw.StartLiveTail(ctx, &cloudwatchlogs.StartLiveTailInput{
+		// LogEventFilterPattern: aws.String(""),
+		LogGroupIdentifiers: []string{strings.TrimSuffix(a.LogGroupARN, ":*")},
+		// LogStreamNamePrefixes: logStreamNamePrefixes,
+		// LogStreamNames: logStreamNamePrefixes,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &LogStreamer{
+		StartLiveTailEventStream: s.GetStream(),
+	}, nil
+}
+
+func (a *AwsEcs) taskStatus(ctx context.Context, taskId string) error {
+	cfg, _ := a.LoadConfig(ctx)
+	ecsClient := ecs.NewFromConfig(cfg)
+
+	// Use DescribeTasks API to check if the task is still running (same as ecs.NewTasksStoppedWaiter)
+	ti, _ := ecsClient.DescribeTasks(ctx, &ecs.DescribeTasksInput{
+		Cluster: aws.String(a.ClusterName), // clusterArnFromTaskArn
+		Tasks:   []string{taskId},
+	})
+	if ti != nil && len(ti.Tasks) > 0 {
+		task := ti.Tasks[0]
+		switch task.StopCode {
+		default:
+			// Before we exit, grab any remaining logs
+			return taskFailure{string(task.StopCode), *task.StoppedReason}
+		case ecsTypes.TaskStopCodeEssentialContainerExited:
+			// Before we exit, grab any remaining logs
+			if *task.Containers[0].ExitCode == 0 {
+				return io.EOF // Success
+			}
+			reason := fmt.Sprintf("%s with code %d", *task.StoppedReason, *task.Containers[0].ExitCode)
+			return taskFailure{string(task.StopCode), reason}
+		case "": // Task is still running
+		}
+	}
+	return nil
 }
 
 func clusterArnFromTaskArn(taskArn string) string {
@@ -87,28 +129,54 @@ func clusterArnFromTaskArn(taskArn string) string {
 	return fmt.Sprintf("arn:aws:ecs:%s:%s:cluster/%s", arnParts[3], arnParts[4], resourceParts[1])
 }
 
-func (a AwsEcs) printLogEvents(ctx context.Context, cw *cloudwatchlogs.Client, logStreamName string, nextToken *string) (*string, error) {
-	for {
-		events, err := cw.GetLogEvents(ctx, &cloudwatchlogs.GetLogEventsInput{
-			LogGroupName:  aws.String(a.LogGroupName),
-			LogStreamName: aws.String(logStreamName),
-			NextToken:     nextToken,
-			StartFromHead: aws.Bool(true),
-		})
-		if err != nil {
-			var resourceNotFound *types.ResourceNotFoundException
-			if !errors.As(err, &resourceNotFound) {
-				return nil, err
+type LogEntry struct {
+	Message   string
+	Timestamp time.Time
+	// Stderr    bool
+}
+
+type LogStreamer struct {
+	*cloudwatchlogs.StartLiveTailEventStream
+}
+
+func (s LogStreamer) Close() error {
+	return s.StartLiveTailEventStream.Close()
+}
+
+func (s LogStreamer) Receive(ctx context.Context) ([]LogEntry, error) {
+	select {
+	case e := <-s.Events(): // blocking
+		switch ev := e.(type) {
+		case *types.StartLiveTailResponseStreamMemberSessionStart:
+			// fmt.Println("session start:", ev.Value.SessionId)
+			return nil, nil // ignore start message
+		case *types.StartLiveTailResponseStreamMemberSessionUpdate:
+			// fmt.Println("session update:", len(ev.Value.SessionResults))
+			entries := make([]LogEntry, len(ev.Value.SessionResults))
+			for i, event := range ev.Value.SessionResults {
+				entries[i] = LogEntry{
+					Message:   *event.Message, // TODO: parse JSON if this is from awsfirelens
+					Timestamp: time.UnixMilli(*event.Timestamp),
+					// Server: LogStreamName,
+				}
 			}
-			break // continue outer loop, waiting for the log stream to be created
+			return entries, nil
+		default:
+			return nil, fmt.Errorf("unexpected event: %T", ev)
 		}
-		for _, event := range events.Events {
-			fmt.Println(*event.Message)
-		}
-		if nextToken != nil && *nextToken == *events.NextForwardToken {
-			break // no new logs
-		}
-		nextToken = events.NextForwardToken
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
-	return nextToken, nil
+}
+
+func (s *LogStreamer) printLogEvents(ctx context.Context) error {
+	for {
+		events, err := s.Receive(ctx)
+		for _, event := range events {
+			fmt.Println(event.Message)
+		}
+		if err != nil {
+			return err
+		}
+	}
 }
