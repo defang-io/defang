@@ -146,3 +146,13 @@ jobs:
           MACOS_NOTARIZATION_APPLE_ID: ${{ secrets.MACOS_NOTARIZATION_APPLE_ID }}
           MACOS_NOTARIZATION_TEAM_ID: ${{ secrets.MACOS_NOTARIZATION_TEAM_ID }}
           MACOS_NOTARIZATION_APP_PW: ${{ secrets.MACOS_NOTARIZATION_APP_PW }}
+
+      - name: Trigger CLI Autodoc
+        uses: peter-evans/repository-dispatch@v1
+        with:
+          token: ${{ secrets.DOCS_ACTION_TRIGGER_TOKEN }}
+          repository: defang-io/defang-docs
+          event-type: cli-autodoc
+          client-payload: '{"version": "${{ github.ref }}"}'
+
+      
