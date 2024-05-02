@@ -15,5 +15,8 @@ RUN pip install -r requirements.txt
 # Copy project
 COPY . /code/
 
+# Collect static files
+RUN python manage.py collectstatic --noinput
+
 # Start server
-CMD python manage.py migrate && python manage.py createsuperuser && gunicorn crm_platform.wsgi:application --bind 0.0.0.0:8000å
+CMD python manage.py migrate && python manage.py createsuperuser && gunicorn crm_platform.wsgi:application --bind 0.0.0.0:8000
