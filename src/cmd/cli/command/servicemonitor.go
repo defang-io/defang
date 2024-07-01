@@ -14,12 +14,12 @@ func waitServiceStatus(ctx context.Context, targetStatus cli.ServiceStatus, serv
 	for _, serviceInfo := range serviceInfos {
 		serviceList = append(serviceList, serviceInfo.Service.Name)
 	}
+	term.Debugf("Waiting for services %v to reach state: %s", serviceList, targetStatus)
 
 	// set up service status subscription (non-blocking)
 	subscribeServiceStatusChan, err := cli.Subscribe(ctx, client, serviceList)
 	if err != nil {
-		term.Debugf("error subscribing to service status: %v", err)
-		return err
+		return fmt.Errorf("error subscribing to service status: %w", err)
 	}
 
 	serviceStatus := make(map[string]string, len(serviceList))
